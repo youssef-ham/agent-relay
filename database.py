@@ -1,20 +1,23 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+Supports SQLite (local default/tests) and PostgreSQL (Compose) via the
+``RELAY_DATABASE_URL``/``DATABASE_URL`` environment variables.  SQLite uses a
+``BEGIN IMMEDIATE`` writer transaction; PostgreSQL uses row locking
+(``FOR UPDATE SKIP LOCKED``) for atomic claims.  The rest of the application
+talks to the models through :mod:`storage`.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -134,6 +137,8 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+ROW_LOCKING = not _is_sqlite(DATABASE_URL)
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -159,7 +164,17 @@ SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False,
 
 
 def init_db() -> None:
-    Base.metadata.create_all(engine)
+    """Create tables, retrying briefly while PostgreSQL starts up."""
+
+    deadline = time.monotonic() + positive_int("RELAY_DB_INIT_TIMEOUT_SECONDS", 60)
+    while True:
+        try:
+            Base.metadata.create_all(engine)
+            return
+        except OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.5)
 
 
 @contextmanager
@@ -177,19 +192,22 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    SQLite has no ``FOR UPDATE SKIP LOCKED``, so a ``BEGIN IMMEDIATE`` writer
+    reservation serializes claims (and recovery or terminal submissions) across
+    API processes.  PostgreSQL instead relies on the row locks taken by
+    ``claim_one``/``recover_expired_in_session`` (``FOR UPDATE SKIP LOCKED``)
+    inside this ordinary transaction.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            connection.begin()
         yield session
         session.flush()
         connection.commit()
@@ -205,13 +223,14 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
+    query = (
+        select(Attempt)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if ROW_LOCKING:
+        query = query.with_for_update(skip_locked=True)
+    expired = list(db.scalars(query))
     count = 0
     for attempt in expired:
         task = db.get(Task, attempt.task_id)
@@ -250,6 +269,7 @@ __all__ = [
     "MAX_BODY_BYTES",
     "MAX_PAGE_SIZE",
     "RECOVERY_INTERVAL_SECONDS",
+    "ROW_LOCKING",
     "Task",
     "as_db_time",
     "db_session",

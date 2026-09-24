@@ -1,0 +1,111 @@
+name: CI/CD
+
+# Homework Question 6: "What should happen if a test fails in the workflow?"
+#
+#   Keep the existing version running and stop the deployment.
+#
+# Pipeline principle:  tests -> build -> deploy
+#
+# Enforcement:
+#   - The `build` job declares `needs: test`, so it is skipped when tests fail.
+#   - The `deploy` job declares `needs: [test, build]`, so it is skipped when
+#     tests (or the build) fail.
+#   - A failed test therefore stops the workflow before any image build or
+#     deployment step; whatever is already running stays running untouched.
+#   - There is intentionally no path that deploys first and tests afterward.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: tests (gate for build and deploy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      - name: Install dependencies from lock file
+        run: uv sync --frozen
+
+      - name: Run test suite
+        run: uv run pytest -q
+
+  build:
+    name: docker build (only after tests pass)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t agent-relay:local .
+
+      - name: Export image for the deploy job
+        run: docker save agent-relay:local | gzip > agent-relay-local.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-relay-image
+          path: agent-relay-local.tar.gz
+          retention-days: 1
+
+  deploy:
+    name: deploy to ephemeral kind cluster (only after tests and build pass)
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-relay-image
+
+      - name: Load image into Docker
+        run: gunzip -c agent-relay-local.tar.gz | docker load
+
+      # GitHub-hosted runners cannot reach a developer's local kind cluster,
+      # so CI deploys to a temporary, runner-local kind cluster instead of the
+      # long-lived cluster on the developer machine.
+      - name: Create temporary kind cluster
+        run: kind create cluster --name agent-relay-ci --wait 120s
+
+      - name: Load image into kind
+        run: kind load docker-image agent-relay:local --name agent-relay-ci
+
+      - name: Deploy existing Kubernetes manifests
+        run: kubectl apply -f k8s/
+
+      - name: Wait for rollouts
+        run: |
+          kubectl rollout status deployment/postgres --timeout=180s
+          kubectl rollout status deployment/agent-relay --timeout=180s
+
+      - name: Verify Agent Relay readiness
+        run: |
+          kubectl get pods
+          kubectl get deployments
+          kubectl get services
+          kubectl get pvc
+          kubectl exec deploy/agent-relay -- python -c \
+            "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5).read().decode())"
+
+      - name: Delete temporary kind cluster
+        if: always()
+        run: kind delete cluster --name agent-relay-ci || true

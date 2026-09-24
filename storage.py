@@ -2,8 +2,9 @@
 
 Routes and the worker call these functions instead of issuing SQL directly.
 Claim, heartbeat, terminal submission, and recovery each use the same atomic
-SQLite transaction seam, which is the one area students will later replace by
-PostgreSQL row-locking operations.
+transaction seam: ``BEGIN IMMEDIATE`` on SQLite, or an ordinary transaction
+with ``FOR UPDATE SKIP LOCKED`` row locks on PostgreSQL, so each task has one
+active lease.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import (
@@ -25,6 +27,7 @@ from database import (
     Attempt,
     LEASE_SECONDS,
     MAX_ATTEMPTS,
+    ROW_LOCKING,
     Task,
     as_db_time,
     db_session,
@@ -105,51 +108,63 @@ def list_agents(limit: int, cursor: tuple[datetime, str] | None) -> tuple[list[A
 
 def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_key: str | None) -> dict[str, str]:
     # Serializing task creation makes the sender-scoped idempotency check and
-    # unique constraint one operation even when two API processes race.
-    with immediate_transaction() as db:
-        recipient = db.get(Agent, recipient_id)
-        if recipient is None:
-            raise RelayError("not_found", "Recipient agent not found.", 404)
-        if idempotency_key is not None:
-            existing = db.scalar(
-                select(Task).where(Task.sender_id == sender_id, Task.idempotency_key == idempotency_key)
-            )
-            if existing is not None:
-                if existing.recipient_id != recipient_id or existing.input != input_text:
-                    raise RelayError(
-                        "idempotency_conflict",
-                        "This Idempotency-Key was already used with a different task.",
-                        409,
+    # unique constraint one operation even when two API processes race.  On
+    # PostgreSQL the writers are not globally serialized, so a concurrent
+    # duplicate can hit the unique constraint first; retry once and return the
+    # row the winner committed.
+    for attempt in range(2):
+        try:
+            with immediate_transaction() as db:
+                recipient = db.get(Agent, recipient_id)
+                if recipient is None:
+                    raise RelayError("not_found", "Recipient agent not found.", 404)
+                if idempotency_key is not None:
+                    existing = db.scalar(
+                        select(Task).where(Task.sender_id == sender_id, Task.idempotency_key == idempotency_key)
                     )
-                return {"task_id": existing.id, "status": existing.status}
-        task = Task(
-            id=new_id("task"),
-            sender_id=sender_id,
-            recipient_id=recipient_id,
-            input=input_text,
-            status="queued",
-            output=None,
-            error=None,
-            attempt_count=0,
-            idempotency_key=idempotency_key,
-            created_at=as_db_time(utcnow()),
-            finished_at=None,
-        )
-        db.add(task)
-        db.flush()
-        return {"task_id": task.id, "status": task.status}
+                    if existing is not None:
+                        if existing.recipient_id != recipient_id or existing.input != input_text:
+                            raise RelayError(
+                                "idempotency_conflict",
+                                "This Idempotency-Key was already used with a different task.",
+                                409,
+                            )
+                        return {"task_id": existing.id, "status": existing.status}
+                task = Task(
+                    id=new_id("task"),
+                    sender_id=sender_id,
+                    recipient_id=recipient_id,
+                    input=input_text,
+                    status="queued",
+                    output=None,
+                    error=None,
+                    attempt_count=0,
+                    idempotency_key=idempotency_key,
+                    created_at=as_db_time(utcnow()),
+                    finished_at=None,
+                )
+                db.add(task)
+                db.flush()
+                return {"task_id": task.id, "status": task.status}
+        except IntegrityError:
+            if idempotency_key is None or attempt == 1:
+                raise
+    raise AssertionError("unreachable")
 
 
 def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
-        task = db.scalar(
+        query = (
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
         )
+        if ROW_LOCKING:
+            query = query.with_for_update(skip_locked=True)
+        task = db.scalar(query)
         if task is None:
             return None
         if task.attempt_count >= MAX_ATTEMPTS:
