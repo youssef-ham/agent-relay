@@ -8,6 +8,9 @@ not from a Python lock.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import time
 import os
 
 # Default to a scratch DB so `pytest` never resets the dev server's
@@ -16,6 +19,7 @@ import os
 os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
 
 from concurrent.futures import ThreadPoolExecutor
+import httpx
 from datetime import timedelta
 
 import pytest
@@ -160,3 +164,91 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
         missing_name = client.post("/api/v1/agents", json={})
         assert missing_name.status_code == 400
         assert missing_name.json()["error"]["code"] == "invalid_input"
+
+
+def test_acceptance_scenario_one_over_real_http_api_and_sqlite(tmp_path, free_tcp_port):
+    """SPEC acceptance scenario 1 through Uvicorn, HTTP, and a separate SQLite file.
+
+    This deliberately does not use TestClient: the server is a real subprocess,
+    as it would be in local development, and receives requests through TCP.
+    """
+
+    database_path = tmp_path / "acceptance-scenario.db"
+    environment = {**os.environ, "RELAY_DATABASE_URL": f"sqlite:///{database_path}"}
+    server = subprocess.Popen(
+        [
+            sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
+            "--port", str(free_tcp_port), "--log-level", "warning",
+        ],
+        cwd=os.path.dirname(__file__),
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    base_url = f"http://127.0.0.1:{free_tcp_port}"
+    try:
+        with httpx.Client(base_url=base_url, timeout=2.0) as client:
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    if client.get("/ready").status_code == 200:
+                        break
+                except httpx.ConnectError:
+                    pass
+                if time.monotonic() >= deadline:
+                    stderr = server.stderr.read() if server.stderr else ""
+                    pytest.fail(f"Uvicorn did not become ready: {stderr}")
+                time.sleep(0.05)
+
+            sender = client.post("/api/v1/agents", json={"name": "agent-1"})
+            recipient = client.post("/api/v1/agents", json={"name": "agent-2"})
+            assert sender.status_code == recipient.status_code == 201
+            sender_data, recipient_data = sender.json(), recipient.json()
+            sender_headers = {"Authorization": f"Bearer {sender_data['token']}"}
+            recipient_headers = {"Authorization": f"Bearer {recipient_data['token']}"}
+
+            created = client.post(
+                "/api/v1/tasks",
+                headers={**sender_headers, "Idempotency-Key": "acceptance-scenario-1"},
+                json={"to": recipient_data["agent_id"], "input": "return integration result"},
+            )
+            assert created.status_code == 201
+            task_id = created.json()["task_id"]
+            assert created.json()["status"] == "queued"
+
+            claim = client.post(
+                "/api/v1/tasks/claim", headers=recipient_headers,
+                json={"worker_id": "agent-2-worker", "wait_seconds": 0},
+            )
+            assert claim.status_code == 200
+            assert claim.json()["task_id"] == task_id
+            assert claim.json()["attempt"] == 1
+
+            completed = client.post(
+                f"/api/v1/tasks/{task_id}/complete", headers=recipient_headers,
+                json={"claim_token": claim.json()["claim_token"], "output": "integration result"},
+            )
+            assert completed.status_code == 200
+            assert completed.json() == {"task_id": task_id, "status": "completed"}
+
+            # These are the same authenticated endpoints rendered by dashboard.html.
+            sender_view = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+            sender_tasks = client.get("/api/v1/tasks?direction=sent&limit=100", headers=sender_headers)
+            attempts = client.get(f"/api/v1/tasks/{task_id}/attempts", headers=sender_headers)
+            assert sender_view.status_code == sender_tasks.status_code == attempts.status_code == 200
+            assert sender_view.json()["status"] == "completed"
+            assert sender_view.json()["output"] == "integration result"
+            assert sender_tasks.json()["items"] == [sender_view.json()]
+            history = attempts.json()["items"]
+            assert len(history) == 1
+            assert history[0]["attempt"] == 1
+            assert history[0]["worker_id"] == "agent-2-worker"
+            assert history[0]["outcome"] == "completed"
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=5)
